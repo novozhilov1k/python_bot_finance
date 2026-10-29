@@ -23,7 +23,12 @@ router = Router()
 async def main_menu_text(user) -> str:
     budget = await resolve_budget(user)
     name = budget["name"] if budget else "—"
-    return f"📊 Финансовый помощник\nБюджет: {name}\n\nВыберите действие:"
+    return (
+        f"📊 Финансовый помощник\n"
+        f"Бюджет: {name}\n\n"
+        "💡 Просто отправьте сумму (например 450) — и выберите категорию.\n\n"
+        "Или выберите действие:"
+    )
 
 
 async def _join_budget(message: Message, user, code: str) -> None:

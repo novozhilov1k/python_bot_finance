@@ -1,7 +1,33 @@
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from services import format_date, format_money
+
+CANCEL_TEXT = "❌ Отмена"
+
+
+def remove_keyboard() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()
+
+
+def categories_reply_keyboard(categories) -> ReplyKeyboardMarkup:
+    """Клавиатура у поля ввода: категории в два столбца + отмена."""
+    rows: list[list[KeyboardButton]] = []
+    for index in range(0, len(categories), 2):
+        chunk = categories[index : index + 2]
+        rows.append([KeyboardButton(text=category["name"]) for category in chunk])
+    rows.append([KeyboardButton(text=CANCEL_TEXT)])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Сумма или категория",
+    )
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
