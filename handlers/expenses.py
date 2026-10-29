@@ -11,15 +11,18 @@ from database import (
     add_expense,
     delete_expense,
     get_categories,
+    get_category,
     get_expense,
     update_expense,
 )
+from handlers.common import main_menu_text
 from handlers.expense_card import show_expense_card
 from keyboards import (
     CANCEL_TEXT,
     back_to_menu_keyboard,
     categories_keyboard,
     categories_reply_keyboard,
+    main_menu_keyboard,
     remove_keyboard,
 )
 from services import format_date, format_money, parse_amount
@@ -40,7 +43,6 @@ def _extract_amount(text: str | None) -> float | None:
     return parse_amount(cleaned)
 
 
-
 async def _expense_for_user(callback: CallbackQuery, expense_id: int):
     user = await resolve_user(callback)
     budget = await resolve_budget(user)
@@ -58,9 +60,14 @@ async def _ask_category(
     categories = await get_categories(budget_id)
     if not categories:
         await state.clear()
+        user = await resolve_user(message)
         await message.answer(
             "Сначала создайте хотя бы одну категорию в разделе «📂 Категории».",
             reply_markup=remove_keyboard(),
+        )
+        await message.answer(
+            await main_menu_text(user),
+            reply_markup=main_menu_keyboard(),
         )
         return
 
@@ -79,12 +86,20 @@ async def _save_expense(
     spent_on = date.today()
     await add_expense(budget_id, category_id, user["id"], amount, spent_on)
     await state.clear()
+
+    category = await get_category(category_id)
+    category_name = category["name"] if category else "—"
+
+    # Подтверждение + автоматический возврат в главное меню
     await message.answer(
-        f"✅ Трата записана\n"
-        f"Сумма: {format_money(amount)} ₽\n"
-        f"Дата: {format_date(spent_on)}\n\n"
-        "Введите следующую сумму или отправьте /start для меню.",
+        f"✅ Трата записана: {format_money(amount)} ₽\n"
+        f"Категория: {category_name}\n"
+        f"Дата: {format_date(spent_on)}",
         reply_markup=remove_keyboard(),
+    )
+    await message.answer(
+        await main_menu_text(user),
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -160,7 +175,12 @@ async def process_category_text(message: Message, state: FSMContext) -> None:
 
     if text.casefold() == CANCEL_TEXT.casefold():
         await state.clear()
+        user = await resolve_user(message)
         await message.answer("Отменено.", reply_markup=remove_keyboard())
+        await message.answer(
+            await main_menu_text(user),
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     # Вместо категории ввели новое число — обновляем сумму
@@ -201,10 +221,17 @@ async def process_category_callback(callback: CallbackQuery, state: FSMContext) 
     spent_on = date.today()
     await add_expense(budget_id, category_id, user["id"], amount, spent_on)
     await state.clear()
+    category = await get_category(category_id)
+    category_name = category["name"] if category else "—"
     await safe_edit(
         callback.message,
-        f"✅ Трата записана\nСумма: {format_money(amount)} ₽\nДата: {format_date(spent_on)}",
-        back_to_menu_keyboard(),
+        f"✅ Трата записана: {format_money(amount)} ₽\n"
+        f"Категория: {category_name}\n"
+        f"Дата: {format_date(spent_on)}",
+    )
+    await callback.message.answer(
+        await main_menu_text(user),
+        reply_markup=main_menu_keyboard(),
     )
     await callback.answer("Записано")
 
