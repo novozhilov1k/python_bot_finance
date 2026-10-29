@@ -8,7 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 from dotenv import load_dotenv
 
-from database import cleanup_old_data, init_db
+from database import cleanup_old_data, close_pool, init_db
 from handlers import categories, common, expenses, export, limits, menu, stats
 from periods import run_period_checks
 
@@ -91,6 +91,7 @@ async def main() -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await bot.session.close()
+        await close_pool()
 
 
 if __name__ == "__main__":

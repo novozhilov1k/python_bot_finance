@@ -7,6 +7,4 @@ build:
   dockerfile: Dockerfile
 
 run:
-  # Постоянное хранилище Amvera монтируется сюда — совпадает с DATABASE_PATH
-  persistenceMount: /data
   containerPort: 8080

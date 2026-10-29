@@ -59,15 +59,15 @@ async def run_period_checks(bot: Bot) -> None:
         stored = budget["current_period_start"]
 
         if not stored:
-            await set_current_period(budget["id"], current_start.isoformat())
-            await ensure_period(budget["id"], current_start.isoformat(), confirmed=1)
+            await set_current_period(budget["id"], current_start)
+            await ensure_period(budget["id"], current_start, confirmed=1)
             continue
 
-        stored_start = date.fromisoformat(stored)
+        stored_start = stored if isinstance(stored, date) else date.fromisoformat(str(stored))
         if current_start <= stored_start:
             continue
 
         await _send_closed_report(bot, budget, stored_start)
-        await set_current_period(budget["id"], current_start.isoformat())
-        await ensure_period(budget["id"], current_start.isoformat(), confirmed=0)
+        await set_current_period(budget["id"], current_start)
+        await ensure_period(budget["id"], current_start, confirmed=0)
         await _send_new_period_prompt(bot, budget, current_start)

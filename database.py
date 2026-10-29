@@ -2,28 +2,44 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import AsyncIterator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import aiosqlite
+import asyncpg
 from dotenv import load_dotenv
 
 from services import get_period_start
 
 load_dotenv()
 
-DB_PATH = os.getenv("DATABASE_PATH", "finance.db")
 DEFAULT_MONTH_START_DAY = 10
+
+
+def _build_dsn(raw: str) -> str:
+    """Убирает параметры, которые asyncpg не понимает (sslmode, channel_binding)."""
+    parts = urlsplit(raw.strip())
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query)
+        if key not in {"sslmode", "channel_binding"}
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+DATABASE_URL = _build_dsn(os.getenv("DATABASE_URL", ""))
+POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
+POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "5"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    telegram_id INTEGER UNIQUE NOT NULL,
+    id SERIAL PRIMARY KEY,
+    telegram_id BIGINT UNIQUE NOT NULL,
     name TEXT,
     active_budget_id INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS budgets (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     type TEXT NOT NULL CHECK(type IN ('personal', 'shared')),
     month_start_day INTEGER DEFAULT 10,
@@ -33,6 +49,8 @@ CREATE TABLE IF NOT EXISTS budgets (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_invite_code ON budgets(invite_code);
+
 CREATE TABLE IF NOT EXISTS budget_members (
     budget_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -41,7 +59,7 @@ CREATE TABLE IF NOT EXISTS budget_members (
 );
 
 CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     budget_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     is_deleted INTEGER DEFAULT 0,
@@ -49,11 +67,11 @@ CREATE TABLE IF NOT EXISTS categories (
 );
 
 CREATE TABLE IF NOT EXISTS limits (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     budget_id INTEGER NOT NULL,
     category_id INTEGER,
     period_start DATE NOT NULL,
-    amount REAL NOT NULL,
+    amount DOUBLE PRECISION NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(budget_id, category_id, period_start)
@@ -63,11 +81,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_general_limit
     ON limits(budget_id, period_start) WHERE category_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS expenses (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     budget_id INTEGER NOT NULL,
     category_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
-    amount REAL NOT NULL,
+    amount DOUBLE PRECISION NOT NULL,
     spent_on DATE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -84,181 +102,210 @@ CREATE TABLE IF NOT EXISTS periods (
 );
 """
 
+_pool: asyncpg.Pool | None = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL не задан. Укажите строку подключения к PostgreSQL "
+                "в .env или в переменных окружения хостинга."
+            )
+        _pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=POOL_MIN_SIZE,
+            max_size=POOL_MAX_SIZE,
+            ssl="require",
+            command_timeout=30,
+        )
+    return _pool
+
+
+async def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+
 
 @asynccontextmanager
-async def connect() -> AsyncIterator[aiosqlite.Connection]:
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL;")
-    await db.execute("PRAGMA busy_timeout=5000;")
-    try:
-        yield db
-    finally:
-        await db.close()
+async def connect() -> AsyncIterator[asyncpg.Connection]:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        yield connection
 
 
-async def _add_column(db: aiosqlite.Connection, table: str, column: str, definition: str) -> None:
-    async with db.execute(f"PRAGMA table_info({table})") as cur:
-        columns = {row["name"] for row in await cur.fetchall()}
-    if column not in columns:
-        await db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+def _as_date(value) -> date:
+    """Приводит ISO-строку или date к date (asyncpg требует настоящий тип)."""
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
 
 
 async def init_db() -> None:
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        await connection.execute(SCHEMA)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL;")
-        await db.execute("PRAGMA busy_timeout=5000;")
-        await db.executescript(SCHEMA)
-
-        # Миграции для баз, созданных предыдущей версией
-        await _add_column(db, "users", "active_budget_id", "active_budget_id INTEGER")
-        await _add_column(db, "budgets", "current_period_start", "current_period_start DATE")
-        await _add_column(db, "budgets", "invite_code", "invite_code TEXT")
-        await db.execute(
+        # Миграции для баз, созданных более ранними версиями
+        await connection.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_budget_id INTEGER"
+        )
+        await connection.execute(
+            "ALTER TABLE budgets ADD COLUMN IF NOT EXISTS current_period_start DATE"
+        )
+        await connection.execute(
+            "ALTER TABLE budgets ADD COLUMN IF NOT EXISTS invite_code TEXT"
+        )
+        await connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_invite_code ON budgets(invite_code)"
         )
 
-        async with db.execute(
+        stale = await connection.fetch(
             "SELECT id, month_start_day FROM budgets WHERE current_period_start IS NULL"
-        ) as cur:
-            stale = await cur.fetchall()
+        )
         for row in stale:
             day = row["month_start_day"] or DEFAULT_MONTH_START_DAY
-            period_start = get_period_start(date.today(), day).isoformat()
-            await db.execute(
-                "UPDATE budgets SET current_period_start = ? WHERE id = ?",
-                (period_start, row["id"]),
+            period_start = get_period_start(date.today(), day)
+            await connection.execute(
+                "UPDATE budgets SET current_period_start = $1 WHERE id = $2",
+                period_start,
+                row["id"],
             )
-            await db.execute(
-                "INSERT OR IGNORE INTO periods (budget_id, period_start, limits_confirmed) "
-                "VALUES (?, ?, 1)",
-                (row["id"], period_start),
+            await connection.execute(
+                "INSERT INTO periods (budget_id, period_start, limits_confirmed) "
+                "VALUES ($1, $2, 1) ON CONFLICT DO NOTHING",
+                row["id"],
+                period_start,
             )
-
-        await db.commit()
 
 
 # --- Пользователи ---
 
 
-async def get_or_create_user(telegram_id: int, name: str) -> aiosqlite.Row:
-    async with connect() as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (telegram_id, name) VALUES (?, ?)",
-            (telegram_id, name),
+async def get_or_create_user(telegram_id: int, name: str) -> asyncpg.Record:
+    async with connect() as connection:
+        return await connection.fetchrow(
+            """
+            INSERT INTO users (telegram_id, name) VALUES ($1, $2)
+            ON CONFLICT (telegram_id) DO UPDATE SET name = EXCLUDED.name
+            RETURNING *
+            """,
+            telegram_id,
+            name,
         )
-        await db.execute(
-            "UPDATE users SET name = ? WHERE telegram_id = ? AND (name IS NULL OR name <> ?)",
-            (name, telegram_id, name),
-        )
-        await db.commit()
-        async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cur:
-            return await cur.fetchone()
 
 
 async def set_active_budget(user_id: int, budget_id: int) -> None:
-    async with connect() as db:
-        await db.execute("UPDATE users SET active_budget_id = ? WHERE id = ?", (budget_id, user_id))
-        await db.commit()
+    async with connect() as connection:
+        await connection.execute(
+            "UPDATE users SET active_budget_id = $1 WHERE id = $2", budget_id, user_id
+        )
 
 
 # --- Бюджеты ---
 
 
-async def get_user_budgets(user_id: int) -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute(
+async def get_user_budgets(user_id: int) -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch(
             """
             SELECT b.* FROM budgets b
             JOIN budget_members bm ON bm.budget_id = b.id
-            WHERE bm.user_id = ?
+            WHERE bm.user_id = $1
             ORDER BY b.id
             """,
-            (user_id,),
-        ) as cur:
-            return await cur.fetchall()
+            user_id,
+        )
 
 
-async def get_all_budgets() -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute("SELECT * FROM budgets ORDER BY id") as cur:
-            return await cur.fetchall()
+async def get_all_budgets() -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch("SELECT * FROM budgets ORDER BY id")
 
 
-async def get_budget(budget_id: int) -> aiosqlite.Row | None:
-    async with connect() as db:
-        async with db.execute("SELECT * FROM budgets WHERE id = ?", (budget_id,)) as cur:
-            return await cur.fetchone()
+async def get_budget(budget_id: int) -> asyncpg.Record | None:
+    async with connect() as connection:
+        return await connection.fetchrow("SELECT * FROM budgets WHERE id = $1", budget_id)
 
 
 async def is_budget_member(budget_id: int, user_id: int) -> bool:
-    async with connect() as db:
-        async with db.execute(
-            "SELECT 1 FROM budget_members WHERE budget_id = ? AND user_id = ?",
-            (budget_id, user_id),
-        ) as cur:
-            return await cur.fetchone() is not None
+    async with connect() as connection:
+        return (
+            await connection.fetchval(
+                "SELECT 1 FROM budget_members WHERE budget_id = $1 AND user_id = $2",
+                budget_id,
+                user_id,
+            )
+            is not None
+        )
 
 
-async def get_budget_members(budget_id: int) -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute(
+async def get_budget_members(budget_id: int) -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch(
             """
             SELECT u.id, u.telegram_id, u.name, bm.role
             FROM budget_members bm
             JOIN users u ON u.id = bm.user_id
-            WHERE bm.budget_id = ?
+            WHERE bm.budget_id = $1
             ORDER BY bm.role DESC, u.id
             """,
-            (budget_id,),
-        ) as cur:
-            return await cur.fetchall()
+            budget_id,
+        )
 
 
 async def count_budget_members(budget_id: int) -> int:
-    async with connect() as db:
-        async with db.execute(
-            "SELECT COUNT(*) AS cnt FROM budget_members WHERE budget_id = ?", (budget_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return int(row["cnt"])
+    async with connect() as connection:
+        return int(
+            await connection.fetchval(
+                "SELECT COUNT(*) FROM budget_members WHERE budget_id = $1", budget_id
+            )
+        )
 
 
 async def add_budget_member(budget_id: int, user_id: int, role: str = "member") -> None:
-    async with connect() as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO budget_members (budget_id, user_id, role) VALUES (?, ?, ?)",
-            (budget_id, user_id, role),
+    async with connect() as connection:
+        await connection.execute(
+            "INSERT INTO budget_members (budget_id, user_id, role) VALUES ($1, $2, $3) "
+            "ON CONFLICT DO NOTHING",
+            budget_id,
+            user_id,
+            role,
         )
-        await db.commit()
 
 
 async def _create_budget(user_id: int, name: str, btype: str, month_start_day: int) -> int:
-    period_start = get_period_start(date.today(), month_start_day).isoformat()
-    async with connect() as db:
-        cur = await db.execute(
-            """
-            INSERT INTO budgets (name, type, month_start_day, owner_user_id, current_period_start)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (name, btype, month_start_day, user_id, period_start),
-        )
-        budget_id = cur.lastrowid
-        await db.execute(
-            "INSERT INTO budget_members (budget_id, user_id, role) VALUES (?, ?, 'owner')",
-            (budget_id, user_id),
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO periods (budget_id, period_start, limits_confirmed) "
-            "VALUES (?, ?, 1)",
-            (budget_id, period_start),
-        )
-        await db.commit()
+    period_start = get_period_start(date.today(), month_start_day)
+    async with connect() as connection:
+        async with connection.transaction():
+            budget_id = await connection.fetchval(
+                """
+                INSERT INTO budgets
+                    (name, type, month_start_day, owner_user_id, current_period_start)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+                """,
+                name,
+                btype,
+                month_start_day,
+                user_id,
+                period_start,
+            )
+            await connection.execute(
+                "INSERT INTO budget_members (budget_id, user_id, role) "
+                "VALUES ($1, $2, 'owner')",
+                budget_id,
+                user_id,
+            )
+            await connection.execute(
+                "INSERT INTO periods (budget_id, period_start, limits_confirmed) "
+                "VALUES ($1, $2, 1) ON CONFLICT DO NOTHING",
+                budget_id,
+                period_start,
+            )
     return budget_id
 
 
@@ -271,46 +318,47 @@ async def create_shared_budget(user_id: int, name: str = "Общий") -> int:
 
 
 async def set_invite_code(budget_id: int, code: str) -> None:
-    async with connect() as db:
-        await db.execute("UPDATE budgets SET invite_code = ? WHERE id = ?", (code, budget_id))
-        await db.commit()
-
-
-async def get_budget_by_invite(code: str) -> aiosqlite.Row | None:
-    async with connect() as db:
-        async with db.execute("SELECT * FROM budgets WHERE invite_code = ?", (code,)) as cur:
-            return await cur.fetchone()
-
-
-async def update_budget_start_day(budget_id: int, day: int, current_period_start: str) -> None:
-    async with connect() as db:
-        await db.execute(
-            "UPDATE budgets SET month_start_day = ?, current_period_start = ? WHERE id = ?",
-            (day, current_period_start, budget_id),
+    async with connect() as connection:
+        await connection.execute(
+            "UPDATE budgets SET invite_code = $1 WHERE id = $2", code, budget_id
         )
-        await db.commit()
+
+
+async def get_budget_by_invite(code: str) -> asyncpg.Record | None:
+    async with connect() as connection:
+        return await connection.fetchrow("SELECT * FROM budgets WHERE invite_code = $1", code)
+
+
+async def update_budget_start_day(
+    budget_id: int, day: int, current_period_start: date | str
+) -> None:
+    async with connect() as connection:
+        await connection.execute(
+            "UPDATE budgets SET month_start_day = $1, current_period_start = $2 WHERE id = $3",
+            day,
+            _as_date(current_period_start),
+            budget_id,
+        )
 
 
 # --- Категории ---
 
 
-async def get_categories(budget_id: int) -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute(
-            "SELECT * FROM categories WHERE budget_id = ? AND is_deleted = 0 ORDER BY name",
-            (budget_id,),
-        ) as cur:
-            return await cur.fetchall()
+async def get_categories(budget_id: int) -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch(
+            "SELECT * FROM categories WHERE budget_id = $1 AND is_deleted = 0 ORDER BY name",
+            budget_id,
+        )
 
 
-async def get_category(category_id: int) -> aiosqlite.Row | None:
-    async with connect() as db:
-        async with db.execute("SELECT * FROM categories WHERE id = ?", (category_id,)) as cur:
-            return await cur.fetchone()
+async def get_category(category_id: int) -> asyncpg.Record | None:
+    async with connect() as connection:
+        return await connection.fetchrow("SELECT * FROM categories WHERE id = $1", category_id)
 
 
-async def find_category_by_name(budget_id: int, name: str) -> aiosqlite.Row | None:
-    # LOWER() в SQLite не работает с кириллицей, поэтому сравниваем в Python
+async def find_category_by_name(budget_id: int, name: str) -> asyncpg.Record | None:
+    # Сравнение в Python: не зависим от настроек collation для кириллицы
     target = name.strip().casefold()
     for row in await get_categories(budget_id):
         if (row["name"] or "").casefold() == target:
@@ -319,281 +367,303 @@ async def find_category_by_name(budget_id: int, name: str) -> aiosqlite.Row | No
 
 
 async def create_category(budget_id: int, name: str) -> int:
-    async with connect() as db:
-        cur = await db.execute(
-            "INSERT INTO categories (budget_id, name) VALUES (?, ?)", (budget_id, name)
+    async with connect() as connection:
+        return await connection.fetchval(
+            "INSERT INTO categories (budget_id, name) VALUES ($1, $2) RETURNING id",
+            budget_id,
+            name,
         )
-        await db.commit()
-        return cur.lastrowid
 
 
 async def rename_category(category_id: int, name: str) -> None:
-    async with connect() as db:
-        await db.execute("UPDATE categories SET name = ? WHERE id = ?", (name, category_id))
-        await db.commit()
+    async with connect() as connection:
+        await connection.execute(
+            "UPDATE categories SET name = $1 WHERE id = $2", name, category_id
+        )
 
 
 async def delete_category(category_id: int, transfer_to_category_id: int) -> None:
-    async with connect() as db:
-        await db.execute(
-            "UPDATE expenses SET category_id = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE category_id = ?",
-            (transfer_to_category_id, category_id),
-        )
-        # Лимит удалённой категории больше не имеет смысла
-        await db.execute("DELETE FROM limits WHERE category_id = ?", (category_id,))
-        await db.execute("UPDATE categories SET is_deleted = 1 WHERE id = ?", (category_id,))
-        await db.commit()
+    async with connect() as connection:
+        async with connection.transaction():
+            await connection.execute(
+                "UPDATE expenses SET category_id = $1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE category_id = $2",
+                transfer_to_category_id,
+                category_id,
+            )
+            # Лимит удалённой категории больше не имеет смысла
+            await connection.execute("DELETE FROM limits WHERE category_id = $1", category_id)
+            await connection.execute(
+                "UPDATE categories SET is_deleted = 1 WHERE id = $1", category_id
+            )
 
 
 # --- Траты ---
 
 
 async def add_expense(
-    budget_id: int, category_id: int, user_id: int, amount: float, spent_on: str
+    budget_id: int, category_id: int, user_id: int, amount: float, spent_on: date | str
 ) -> int:
-    async with connect() as db:
-        cur = await db.execute(
+    async with connect() as connection:
+        return await connection.fetchval(
             """
             INSERT INTO expenses (budget_id, category_id, user_id, amount, spent_on)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
             """,
-            (budget_id, category_id, user_id, amount, spent_on),
+            budget_id,
+            category_id,
+            user_id,
+            float(amount),
+            _as_date(spent_on),
         )
-        await db.commit()
-        return cur.lastrowid
 
 
 async def get_expenses_by_category(
-    budget_id: int, category_id: int, start_date: str, end_date: str
-) -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute(
+    budget_id: int, category_id: int, start_date: date | str, end_date: date | str
+) -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch(
             """
             SELECT * FROM expenses
-            WHERE budget_id = ? AND category_id = ? AND spent_on BETWEEN ? AND ?
+            WHERE budget_id = $1 AND category_id = $2 AND spent_on BETWEEN $3 AND $4
             ORDER BY spent_on DESC, id DESC
             """,
-            (budget_id, category_id, start_date, end_date),
-        ) as cur:
-            return await cur.fetchall()
+            budget_id,
+            category_id,
+            _as_date(start_date),
+            _as_date(end_date),
+        )
 
 
 async def get_expenses_for_period(
-    budget_id: int, start_date: str, end_date: str
-) -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute(
+    budget_id: int, start_date: date | str, end_date: date | str
+) -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch(
             """
             SELECT e.*, c.name AS category_name
             FROM expenses e
             JOIN categories c ON c.id = e.category_id
-            WHERE e.budget_id = ? AND e.spent_on BETWEEN ? AND ?
+            WHERE e.budget_id = $1 AND e.spent_on BETWEEN $2 AND $3
             ORDER BY e.spent_on DESC, e.id DESC
             """,
-            (budget_id, start_date, end_date),
-        ) as cur:
-            return await cur.fetchall()
+            budget_id,
+            _as_date(start_date),
+            _as_date(end_date),
+        )
 
 
-async def get_expense_sums(budget_id: int, start_date: str, end_date: str) -> dict[int, float]:
-    async with connect() as db:
-        async with db.execute(
+async def get_expense_sums(
+    budget_id: int, start_date: date | str, end_date: date | str
+) -> dict[int, float]:
+    async with connect() as connection:
+        rows = await connection.fetch(
             """
             SELECT category_id, SUM(amount) AS total
             FROM expenses
-            WHERE budget_id = ? AND spent_on BETWEEN ? AND ?
+            WHERE budget_id = $1 AND spent_on BETWEEN $2 AND $3
             GROUP BY category_id
             """,
-            (budget_id, start_date, end_date),
-        ) as cur:
-            rows = await cur.fetchall()
+            budget_id,
+            _as_date(start_date),
+            _as_date(end_date),
+        )
     return {row["category_id"]: float(row["total"]) for row in rows}
 
 
-async def get_expense(expense_id: int) -> aiosqlite.Row | None:
-    async with connect() as db:
-        async with db.execute("SELECT * FROM expenses WHERE id = ?", (expense_id,)) as cur:
-            return await cur.fetchone()
+async def get_expense(expense_id: int) -> asyncpg.Record | None:
+    async with connect() as connection:
+        return await connection.fetchrow("SELECT * FROM expenses WHERE id = $1", expense_id)
 
 
 async def delete_expense(expense_id: int) -> None:
-    async with connect() as db:
-        await db.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
-        await db.commit()
+    async with connect() as connection:
+        await connection.execute("DELETE FROM expenses WHERE id = $1", expense_id)
 
 
 async def update_expense(expense_id: int, field: str, value) -> None:
     if field not in {"amount", "category_id"}:
         raise ValueError(f"Недопустимое поле: {field}")
-    async with connect() as db:
-        await db.execute(
-            f"UPDATE expenses SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (value, expense_id),
+    if field == "amount":
+        value = float(value)
+    async with connect() as connection:
+        await connection.execute(
+            f"UPDATE expenses SET {field} = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+            value,
+            expense_id,
         )
-        await db.commit()
 
 
 # --- Лимиты ---
 
 
-async def get_limits_for_period(budget_id: int, period_start: str) -> list[aiosqlite.Row]:
-    async with connect() as db:
-        async with db.execute(
+async def get_limits_for_period(
+    budget_id: int, period_start: date | str
+) -> list[asyncpg.Record]:
+    async with connect() as connection:
+        return await connection.fetch(
             """
             SELECT * FROM limits
-            WHERE budget_id = ? AND period_start = ?
+            WHERE budget_id = $1 AND period_start = $2
             ORDER BY (category_id IS NULL) DESC, category_id
             """,
-            (budget_id, period_start),
-        ) as cur:
-            return await cur.fetchall()
+            budget_id,
+            _as_date(period_start),
+        )
 
 
 async def get_limit(
-    budget_id: int, category_id: int | None, period_start: str
-) -> aiosqlite.Row | None:
-    async with connect() as db:
+    budget_id: int, category_id: int | None, period_start: date | str
+) -> asyncpg.Record | None:
+    async with connect() as connection:
         if category_id is None:
-            query = (
-                "SELECT * FROM limits WHERE budget_id = ? AND category_id IS NULL "
-                "AND period_start = ?"
+            return await connection.fetchrow(
+                "SELECT * FROM limits WHERE budget_id = $1 AND category_id IS NULL "
+                "AND period_start = $2",
+                budget_id,
+                _as_date(period_start),
             )
-            params = (budget_id, period_start)
-        else:
-            query = (
-                "SELECT * FROM limits WHERE budget_id = ? AND category_id = ? "
-                "AND period_start = ?"
-            )
-            params = (budget_id, category_id, period_start)
-        async with db.execute(query, params) as cur:
-            return await cur.fetchone()
+        return await connection.fetchrow(
+            "SELECT * FROM limits WHERE budget_id = $1 AND category_id = $2 "
+            "AND period_start = $3",
+            budget_id,
+            category_id,
+            _as_date(period_start),
+        )
 
 
 async def set_limit(
-    budget_id: int, category_id: int | None, period_start: str, amount: float
+    budget_id: int, category_id: int | None, period_start: date | str, amount: float
 ) -> None:
-    async with connect() as db:
-        if category_id is None:
-            query = (
-                "SELECT * FROM limits WHERE budget_id = ? AND category_id IS NULL "
-                "AND period_start = ?"
+    period = _as_date(period_start)
+    async with connect() as connection:
+        async with connection.transaction():
+            if category_id is None:
+                existing_id = await connection.fetchval(
+                    "SELECT id FROM limits WHERE budget_id = $1 AND category_id IS NULL "
+                    "AND period_start = $2",
+                    budget_id,
+                    period,
+                )
+            else:
+                existing_id = await connection.fetchval(
+                    "SELECT id FROM limits WHERE budget_id = $1 AND category_id = $2 "
+                    "AND period_start = $3",
+                    budget_id,
+                    category_id,
+                    period,
+                )
+
+            if existing_id:
+                await connection.execute(
+                    "UPDATE limits SET amount = $1, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = $2",
+                    float(amount),
+                    existing_id,
+                )
+            else:
+                await connection.execute(
+                    "INSERT INTO limits (budget_id, category_id, period_start, amount) "
+                    "VALUES ($1, $2, $3, $4)",
+                    budget_id,
+                    category_id,
+                    period,
+                    float(amount),
+                )
+
+            # Пользователь задал лимиты — подтверждение периода больше не нужно
+            await connection.execute(
+                "INSERT INTO periods (budget_id, period_start, limits_confirmed) "
+                "VALUES ($1, $2, 1) ON CONFLICT (budget_id, period_start) "
+                "DO UPDATE SET limits_confirmed = 1",
+                budget_id,
+                period,
             )
-            params = (budget_id, period_start)
-        else:
-            query = (
-                "SELECT * FROM limits WHERE budget_id = ? AND category_id = ? "
-                "AND period_start = ?"
-            )
-            params = (budget_id, category_id, period_start)
-        async with db.execute(query, params) as cur:
-            existing = await cur.fetchone()
-        if existing:
-            await db.execute(
-                "UPDATE limits SET amount = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (amount, existing["id"]),
-            )
-        else:
-            await db.execute(
-                """
-                INSERT INTO limits (budget_id, category_id, period_start, amount)
-                VALUES (?, ?, ?, ?)
-                """,
-                (budget_id, category_id, period_start, amount),
-            )
-        # Пользователь задал лимиты — подтверждение периода больше не нужно
-        await db.execute(
-            "INSERT OR IGNORE INTO periods (budget_id, period_start, limits_confirmed) "
-            "VALUES (?, ?, 1)",
-            (budget_id, period_start),
-        )
-        await db.execute(
-            "UPDATE periods SET limits_confirmed = 1 WHERE budget_id = ? AND period_start = ?",
-            (budget_id, period_start),
-        )
-        await db.commit()
 
 
-async def copy_limits(budget_id: int, from_period: str, to_period: str) -> int:
-    async with connect() as db:
-        async with db.execute(
-            "SELECT category_id, amount FROM limits WHERE budget_id = ? AND period_start = ?",
-            (budget_id, from_period),
-        ) as cur:
-            rows = await cur.fetchall()
-        for row in rows:
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO limits (budget_id, category_id, period_start, amount)
-                VALUES (?, ?, ?, ?)
-                """,
-                (budget_id, row["category_id"], to_period, row["amount"]),
+async def copy_limits(
+    budget_id: int, from_period: date | str, to_period: date | str
+) -> int:
+    source = _as_date(from_period)
+    target = _as_date(to_period)
+    async with connect() as connection:
+        async with connection.transaction():
+            rows = await connection.fetch(
+                "SELECT category_id, amount FROM limits "
+                "WHERE budget_id = $1 AND period_start = $2",
+                budget_id,
+                source,
             )
-        await db.execute(
-            "INSERT OR IGNORE INTO periods (budget_id, period_start, limits_confirmed) "
-            "VALUES (?, ?, 1)",
-            (budget_id, to_period),
-        )
-        await db.execute(
-            "UPDATE periods SET limits_confirmed = 1 WHERE budget_id = ? AND period_start = ?",
-            (budget_id, to_period),
-        )
-        await db.commit()
-        return len(rows)
+            for row in rows:
+                await connection.execute(
+                    "INSERT INTO limits (budget_id, category_id, period_start, amount) "
+                    "VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    budget_id,
+                    row["category_id"],
+                    target,
+                    row["amount"],
+                )
+            await connection.execute(
+                "INSERT INTO periods (budget_id, period_start, limits_confirmed) "
+                "VALUES ($1, $2, 1) ON CONFLICT (budget_id, period_start) "
+                "DO UPDATE SET limits_confirmed = 1",
+                budget_id,
+                target,
+            )
+    return len(rows)
 
 
 # --- Периоды ---
 
 
-async def ensure_period(budget_id: int, period_start: str, confirmed: int = 0) -> None:
-    async with connect() as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO periods (budget_id, period_start, limits_confirmed) "
-            "VALUES (?, ?, ?)",
-            (budget_id, period_start, confirmed),
+async def ensure_period(budget_id: int, period_start: date | str, confirmed: int = 0) -> None:
+    async with connect() as connection:
+        await connection.execute(
+            "INSERT INTO periods (budget_id, period_start, limits_confirmed) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            budget_id,
+            _as_date(period_start),
+            confirmed,
         )
-        await db.commit()
 
 
-async def get_period_row(budget_id: int, period_start: str) -> aiosqlite.Row | None:
-    async with connect() as db:
-        async with db.execute(
-            "SELECT * FROM periods WHERE budget_id = ? AND period_start = ?",
-            (budget_id, period_start),
-        ) as cur:
-            return await cur.fetchone()
-
-
-async def confirm_period(budget_id: int, period_start: str) -> None:
-    async with connect() as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO periods (budget_id, period_start, limits_confirmed) "
-            "VALUES (?, ?, 1)",
-            (budget_id, period_start),
+async def get_period_row(budget_id: int, period_start: date | str) -> asyncpg.Record | None:
+    async with connect() as connection:
+        return await connection.fetchrow(
+            "SELECT * FROM periods WHERE budget_id = $1 AND period_start = $2",
+            budget_id,
+            _as_date(period_start),
         )
-        await db.execute(
-            "UPDATE periods SET limits_confirmed = 1 WHERE budget_id = ? AND period_start = ?",
-            (budget_id, period_start),
-        )
-        await db.commit()
 
 
-async def set_current_period(budget_id: int, period_start: str) -> None:
-    async with connect() as db:
-        await db.execute(
-            "UPDATE budgets SET current_period_start = ? WHERE id = ?",
-            (period_start, budget_id),
+async def confirm_period(budget_id: int, period_start: date | str) -> None:
+    async with connect() as connection:
+        await connection.execute(
+            "INSERT INTO periods (budget_id, period_start, limits_confirmed) "
+            "VALUES ($1, $2, 1) ON CONFLICT (budget_id, period_start) "
+            "DO UPDATE SET limits_confirmed = 1",
+            budget_id,
+            _as_date(period_start),
         )
-        await db.commit()
+
+
+async def set_current_period(budget_id: int, period_start: date | str) -> None:
+    async with connect() as connection:
+        await connection.execute(
+            "UPDATE budgets SET current_period_start = $1 WHERE id = $2",
+            _as_date(period_start),
+            budget_id,
+        )
 
 
 # --- Обслуживание ---
 
 
 async def cleanup_old_data(months: int = 6) -> None:
-    cutoff = (date.today() - timedelta(days=months * 30)).isoformat()
-    async with connect() as db:
-        await db.execute("DELETE FROM expenses WHERE spent_on < ?", (cutoff,))
-        await db.execute("DELETE FROM limits WHERE period_start < ?", (cutoff,))
-        await db.execute("DELETE FROM periods WHERE period_start < ?", (cutoff,))
-        await db.commit()
+    cutoff = date.today() - timedelta(days=months * 30)
+    async with connect() as connection:
+        async with connection.transaction():
+            await connection.execute("DELETE FROM expenses WHERE spent_on < $1", cutoff)
+            await connection.execute("DELETE FROM limits WHERE period_start < $1", cutoff)
+            await connection.execute("DELETE FROM periods WHERE period_start < $1", cutoff)
