@@ -69,3 +69,37 @@ def parse_amount(text: str | None) -> float | None:
     if not math.isfinite(value) or value <= 0 or value > 10_000_000:
         return None
     return round(value, 2)
+
+
+BAR_WIDTH = 8
+BAR_EMPTY = "⬜"
+
+
+def _bar_level_cell(ratio: float) -> str:
+    """Цвет ячейки зависит от доли лимита."""
+    if ratio > 1:
+        return "🟥"
+    if ratio >= 0.8:
+        return "🟨"
+    return "🟩"
+
+
+def format_progress(spent: float, limit: float, width: int = BAR_WIDTH) -> str:
+    """Прогресс-бар освоения лимита: 🟩🟩⬜⬜⬜⬜⬜⬜ 25%."""
+    spent, limit = float(spent), float(limit)
+    ratio = (spent / limit) if limit else 0.0
+    filled = min(width, max(0, round(ratio * width)))
+    # Маленькая трата не должна выглядеть как ноль
+    if filled == 0 and spent > 0:
+        filled = 1
+    cell = _bar_level_cell(ratio)
+    bar = cell * filled + BAR_EMPTY * (width - filled)
+    return f"{bar} {int(round(ratio * 100))}%"
+
+
+def progress_status(spent: float, limit: float) -> str:
+    if spent > limit:
+        return "🔴"
+    if spent >= limit * 0.8:
+        return "🟠"
+    return "🟢"
